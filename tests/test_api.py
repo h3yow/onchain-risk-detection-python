@@ -1,15 +1,8 @@
-"""HTTP 层：幂等、冲突状态码归类、账本与风险查询。"""
+"""HTTP 层：幂等、冲突状态码归类、账本与风险查询。
+
+client 夹具定义在 conftest.py 中共享。
+"""
 from __future__ import annotations
-
-import pytest
-from fastapi.testclient import TestClient
-
-from main import app
-
-
-@pytest.fixture
-def client():
-    return TestClient(app)
 
 
 def _tx(tid="t1", **kw):

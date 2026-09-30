@@ -24,22 +24,37 @@ def log_stream(logger: logging.Logger, txs: list[Transaction], note: str = "") -
 
 
 def log_decision(logger: logging.Logger, score: RiskScore) -> None:
-    """打印判定依据：总分、级别、每个因子、数据不足原因。"""
+    """打印判定依据：总分、级别、完整度、每个因子的证据状态与数据不足原因。"""
+    c = score.completeness
+    completeness_text = (
+        f" completeness={c.evaluated_dimensions}/{c.total_dimensions}"
+        f"(pending={c.pending_dimensions},missing={c.missing_dimensions})"
+        f" coverage={c.coverage_ratio} confidence={c.confidence.value}"
+        f" gradeable={c.sufficient_for_grade}"
+        if c is not None
+        else ""
+    )
     logger.info(
-        "DECISION addr=%s level=%s score=%s @block=%s key=%s",
+        "DECISION addr=%s level=%s score=%s @block=%s key=%s%s",
         score.address,
         score.level.value,
         score.score,
         score.evaluated_at_block,
         score.determinism_key,
+        completeness_text,
     )
     for f in score.factors:
         logger.info(
-            "  FACTOR %-20s triggered=%-5s weight=%-5s | %s",
+            "  FACTOR %-20s status=%-12s triggered=%-5s weight=%-5s | %s%s",
             f.code.value,
+            f.status.value,
             f.triggered,
             f.weight,
             f.detail,
+            f" | 缺证据原因={f.insufficiency_code}: {f.insufficiency_detail}"
+            if f.insufficiency_code
+            else "",
         )
     for r in score.insufficient_reasons:
-        logger.info("  UNKNOWN-REASON %s | %s", r.code, r.detail)
+        scope = r.factor.value if r.factor else "OVERALL"
+        logger.info("  UNKNOWN-REASON [%-22s] %s | %s", scope, r.code, r.detail)

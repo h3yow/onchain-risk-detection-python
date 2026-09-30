@@ -9,7 +9,9 @@ from __future__ import annotations
 import logging
 
 import pytest
+from fastapi.testclient import TestClient
 
+from main import app
 from risk_engine.models import Transaction
 from risk_engine.service import RiskService
 from risk_engine import synthetic
@@ -19,6 +21,11 @@ from risk_engine import synthetic
 @pytest.fixture
 def logger() -> logging.Logger:
     return logging.getLogger("risk-tests")
+
+
+@pytest.fixture
+def client() -> TestClient:
+    return TestClient(app)
 
 
 @pytest.fixture

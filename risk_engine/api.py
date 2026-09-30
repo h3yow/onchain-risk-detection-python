@@ -45,14 +45,42 @@ def _risk_to_dict(r: RiskScore) -> dict:
                 "weight": f.weight,
                 "detail": f.detail,
                 "related": list(f.related),
+                # 新增：维度级证据状态与缺证据原因（旧消费方可忽略）
+                "status": f.status.value,
+                "insufficiency_code": f.insufficiency_code,
+                "insufficiency_detail": f.insufficiency_detail,
             }
             for f in r.factors
         ],
         "insufficient_reasons": [
-            {"code": x.code, "detail": x.detail} for x in r.insufficient_reasons
+            {
+                "code": x.code,
+                "detail": x.detail,
+                # 新增：原因为 None 时是整体级原因，否则归属到具体维度
+                "factor": x.factor.value if x.factor else None,
+            }
+            for x in r.insufficient_reasons
         ],
         "evaluated_at_block": r.evaluated_at_block,
         "determinism_key": r.determinism_key,
+        # 新增：完整度汇总
+        "completeness": _completeness_to_dict(r.completeness)
+        if r.completeness is not None
+        else None,
+    }
+
+
+def _completeness_to_dict(c) -> dict:
+    return {
+        "total_dimensions": c.total_dimensions,
+        "evaluated_dimensions": c.evaluated_dimensions,
+        "pending_dimensions": c.pending_dimensions,
+        "missing_dimensions": c.missing_dimensions,
+        "evaluated": [x.value for x in c.evaluated],
+        "not_evaluated": [x.value for x in c.not_evaluated],
+        "coverage_ratio": c.coverage_ratio,
+        "confidence": c.confidence.value,
+        "sufficient_for_grade": c.sufficient_for_grade,
     }
 
 

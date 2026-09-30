@@ -54,6 +54,19 @@ class IngestResult:
     reason: str | None = None
 
 
+class EvidenceStatus(str, Enum):
+    """单个风险维度的证据充分程度。
+
+    - SUFFICIENT   证据足够，本维度给出了明确的触发/未触发判断；
+    - INSUFFICIENT 有相关数据，但样本不足以支撑结论（样本方向单一、
+                   对手方缺失、时间跨度/窗口样本不够等），detail 说明缺什么；
+    - NO_DATA      完全没有可用于该维度的数据（如该维度方向上零笔交互）。
+    """
+    SUFFICIENT = "SUFFICIENT"
+    INSUFFICIENT = "INSUFFICIENT"
+    NO_DATA = "NO_DATA"
+
+
 @dataclass(frozen=True)
 class FactorEvidence:
     code: FactorCode
@@ -61,13 +74,44 @@ class FactorEvidence:
     weight: float            # 该因子贡献分值（0 表示未触发）
     detail: str              # 人可读的判定依据
     related: tuple[str, ...] = ()
+    # 新增：维度级证据状态。只有 SUFFICIENT 时 triggered 才有判定意义；
+    # INSUFFICIENT/NO_DATA 时 triggered 恒为 False（证据不足不得当作“查过没问题”）。
+    status: EvidenceStatus = EvidenceStatus.SUFFICIENT
+    insufficiency_code: str | None = None  # 非 SUFFICIENT 时的机读原因码
+    insufficiency_detail: str | None = None  # 非 SUFFICIENT 时“缺什么”的说明
 
 
 @dataclass(frozen=True)
 class Insufficiency:
-    """数据不足/无法判定的原因。"""
+    """数据不足/无法判定的原因。
+
+    factor 非空时表示某一维度级别的缺证据原因；为空时表示整体级别的原因
+    （如参与交易过少、可评估维度覆盖率不足、账本为空）。
+    """
     code: str
     detail: str
+    factor: FactorCode | None = None
+
+
+class ConfidenceLevel(str, Enum):
+    """整体结论可信度，由可评估维度的覆盖率决定。"""
+    HIGH = "HIGH"      # 覆盖率 >= 高门槛：结论由多数维度支撑
+    MEDIUM = "MEDIUM"  # 覆盖率达到可判定门槛但未到高门槛
+    LOW = "LOW"        # 覆盖率低于可判定门槛：结论只能是 UNKNOWN
+
+
+@dataclass(frozen=True)
+class CompletenessSummary:
+    """本次评估的完整度汇总，供人工复核一眼判断结论由多少维度支撑。"""
+    total_dimensions: int
+    evaluated_dimensions: int                          # status=SUFFICIENT 的维度数
+    pending_dimensions: int                            # status=INSUFFICIENT 的维度数
+    missing_dimensions: int                            # status=NO_DATA 的维度数
+    evaluated: tuple[FactorCode, ...]                  # 已评上的维度
+    not_evaluated: tuple[FactorCode, ...]              # 没评上的维度（不足+无数据）
+    coverage_ratio: float                              # evaluated / total，0~1
+    confidence: ConfidenceLevel                        # 整体可信度
+    sufficient_for_grade: bool                         # 覆盖是否达到分级门槛
 
 
 class RiskLevel(str, Enum):
@@ -86,6 +130,8 @@ class RiskScore:
     insufficient_reasons: tuple[Insufficiency, ...]
     evaluated_at_block: int
     determinism_key: str  # 输入指纹，保证同输入同结论
+    # 新增：完整度汇总（旧消费方可忽略；评分入口恒会填充）
+    completeness: CompletenessSummary | None = None
 
 
 @dataclass(frozen=True)

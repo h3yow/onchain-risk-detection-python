@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from .models import FactorEvidence, FactorCode, Transaction
+from .models import EvidenceStatus, FactorEvidence, FactorCode, Transaction
 
 
 class FactorCalculator:
@@ -26,6 +26,16 @@ class FactorCalculator:
     HIGH_FREQ_WINDOW = 5.0         # 时间窗口（秒）
     HIGH_FREQ_COUNT = 4            # 窗口内交互笔数达到值
     INDIRECT_MAX_HOPS = 2          # 间接关联最大跳数
+
+    # 维度级证据充分口径（详见 README“维度级证据判定口径”）：
+    # 未触发时，只有观测面覆盖到“足以排除”的程度才算证据充分（可安全放行）；
+    # 有观测但覆盖面不足 -> INSUFFICIENT，并给出具体缺什么；
+    # 完全没有相关数据 -> NO_DATA。
+    CONVERGENCE_NEGATIVE_MIN_SOURCES = 3   # 入账方向上至少看过 3 个不同来源
+    DISPERSION_NEGATIVE_MIN_TARGETS = 3    # 出账方向上至少看过 3 个不同目标
+    HIGH_RISK_DIRECT_MIN_COUNTERPARTIES = 2  # 至少见过 2 个不同直接对手方
+    HIGH_FREQ_MIN_SPAN = 5.0               # 观测时间跨度至少覆盖一个判定窗口
+    INDIRECT_MIN_INTERMEDIARIES = 1        # 至少存在 1 个可展开 2 跳的中间地址
 
     def __init__(self, transactions: list[Transaction], high_risk: set[str]) -> None:
         self._txs = transactions
@@ -49,9 +59,39 @@ class FactorCalculator:
             self.high_risk_indirect(address),
         )
 
+    @staticmethod
+    def _evidence(
+        code: FactorCode,
+        triggered: bool,
+        weight: float,
+        detail: str,
+        related: tuple[str, ...] = (),
+        status: EvidenceStatus = EvidenceStatus.SUFFICIENT,
+        gap_code: str | None = None,
+        gap_detail: str | None = None,
+    ) -> FactorEvidence:
+        """统一构造因子证据；未触发且证据不充分时挂上缺证据原因。"""
+        if triggered:
+            # 触发即证据充分：观测本身已支撑正向结论
+            status = EvidenceStatus.SUFFICIENT
+            gap_code = gap_detail = None
+        return FactorEvidence(
+            code=code,
+            triggered=triggered,
+            weight=weight if triggered else 0.0,
+            detail=detail,
+            related=related,
+            evidence_status=status,
+            gap_code=gap_code,
+            gap_detail=gap_detail,
+        )
+
     def convergence(self, address: str) -> FactorEvidence:
         """资金汇聚：多个不同来源向该地址转入。"""
-        sources = self._inn.get(address, set())
+        incoming = [
+            t for t in self._participation.get(address, ()) if t.to_addr == address
+        ]
+        sources = {t.from_addr for t in incoming}
         n = len(sources)
         hit = n >= self.CONVERGENCE_IN_DEGREE
         if hit:
@@ -59,22 +99,45 @@ class FactorCalculator:
                 f"检测到 {n} 个不同来源地址向 {address} 转入"
                 f"（阈值>={self.CONVERGENCE_IN_DEGREE}），呈资金汇聚形态"
             )
-        else:
-            detail = (
-                f"入账来源数={n}，未达汇聚阈值"
-                f"{self.CONVERGENCE_IN_DEGREE}"
+            return self._evidence(
+                FactorCode.FUND_CONVERGENCE, True, self.WEIGHT_CONVERGENCE, detail,
+                related=tuple(sorted(sources)),
             )
-        return FactorEvidence(
-            code=FactorCode.FUND_CONVERGENCE,
-            triggered=hit,
-            weight=self.WEIGHT_CONVERGENCE if hit else 0.0,
-            detail=detail,
+        detail = (
+            f"入账来源数={n}，未达汇聚阈值{self.CONVERGENCE_IN_DEGREE}"
+        )
+        if not incoming:
+            return self._evidence(
+                FactorCode.FUND_CONVERGENCE, False, 0.0,
+                f"{detail}；该地址没有任何入账记录，本维度完全无数据",
+                status=EvidenceStatus.NO_DATA,
+                gap_code="NO_INCOMING_TX",
+                gap_detail=f"地址 {address} 无任何入账交易，无法评估资金汇聚",
+            )
+        if n < self.CONVERGENCE_NEGATIVE_MIN_SOURCES:
+            return self._evidence(
+                FactorCode.FUND_CONVERGENCE, False, 0.0,
+                f"{detail}；入账仅覆盖 {n} 个来源，样本方向不足以排除汇聚",
+                status=EvidenceStatus.INSUFFICIENT,
+                gap_code="TOO_FEW_INCOMING_SOURCES",
+                gap_detail=(
+                    f"仅观察到 {n} 个不同入账来源（充分口径需 "
+                    f"{self.CONVERGENCE_NEGATIVE_MIN_SOURCES} 个），"
+                    "入账样本面太窄，不能排除资金汇聚"
+                ),
+                related=tuple(sorted(sources)),
+            )
+        return self._evidence(
+            FactorCode.FUND_CONVERGENCE, False, 0.0, detail,
             related=tuple(sorted(sources)),
         )
 
     def dispersion(self, address: str) -> FactorEvidence:
         """资金分散：该地址向多个不同目标转出。"""
-        targets = self._out.get(address, set())
+        outgoing = [
+            t for t in self._participation.get(address, ()) if t.from_addr == address
+        ]
+        targets = {t.to_addr for t in outgoing}
         n = len(targets)
         hit = n >= self.DISPERSION_OUT_DEGREE
         if hit:
@@ -82,13 +145,34 @@ class FactorCalculator:
                 f"{address} 向 {n} 个不同目标地址转出"
                 f"（阈值>={self.DISPERSION_OUT_DEGREE}），呈资金分散形态"
             )
-        else:
-            detail = f"出账目标数={n}，未达分散阈值{self.DISPERSION_OUT_DEGREE}"
-        return FactorEvidence(
-            code=FactorCode.FUND_DISPERSION,
-            triggered=hit,
-            weight=self.WEIGHT_DISPERSION if hit else 0.0,
-            detail=detail,
+            return self._evidence(
+                FactorCode.FUND_DISPERSION, True, self.WEIGHT_DISPERSION, detail,
+                related=tuple(sorted(targets)),
+            )
+        detail = f"出账目标数={n}，未达分散阈值{self.DISPERSION_OUT_DEGREE}"
+        if not outgoing:
+            return self._evidence(
+                FactorCode.FUND_DISPERSION, False, 0.0,
+                f"{detail}；该地址没有任何出账记录，本维度完全无数据",
+                status=EvidenceStatus.NO_DATA,
+                gap_code="NO_OUTGOING_TX",
+                gap_detail=f"地址 {address} 无任何出账交易，无法评估资金分散",
+            )
+        if n < self.DISPERSION_NEGATIVE_MIN_TARGETS:
+            return self._evidence(
+                FactorCode.FUND_DISPERSION, False, 0.0,
+                f"{detail}；出账仅覆盖 {n} 个目标，样本方向不足以排除分散",
+                status=EvidenceStatus.INSUFFICIENT,
+                gap_code="TOO_FEW_OUTGOING_TARGETS",
+                gap_detail=(
+                    f"仅观察到 {n} 个不同出账目标（充分口径需 "
+                    f"{self.DISPERSION_NEGATIVE_MIN_TARGETS} 个），"
+                    "出账样本面太窄，不能排除资金分散"
+                ),
+                related=tuple(sorted(targets)),
+            )
+        return self._evidence(
+            FactorCode.FUND_DISPERSION, False, 0.0, detail,
             related=tuple(sorted(targets)),
         )
 
@@ -101,16 +185,36 @@ class FactorCalculator:
                 f"检测到经过 {address} 的资金环：{' -> '.join(cycle)}，"
                 "资金最终回流，疑似环形流转"
             )
-            related = tuple(cycle)
-        else:
-            detail = "未检测到经过该地址的有向资金环"
-            related = ()
-        return FactorEvidence(
-            code=FactorCode.RING_FLOW,
-            triggered=hit,
-            weight=self.WEIGHT_RING if hit else 0.0,
-            detail=detail,
-            related=related,
+            return self._evidence(
+                FactorCode.RING_FLOW, True, self.WEIGHT_RING, detail,
+                related=tuple(cycle),
+            )
+        # 无环时，依据样本结构判断证据是否足以排除
+        has_out = bool(self._out.get(address))
+        has_in = bool(self._inn.get(address))
+        if not has_out and not has_in:
+            return self._evidence(
+                FactorCode.RING_FLOW, False, 0.0,
+                "该地址无任何交易，无法评估环形流转",
+                status=EvidenceStatus.NO_DATA,
+                gap_code="NO_PARTICIPATION",
+                gap_detail=f"地址 {address} 未参与任何交易，环形流转维度完全无数据",
+            )
+        if not has_out or not has_in:
+            return self._evidence(
+                FactorCode.RING_FLOW, False, 0.0,
+                "未检测到经过该地址的有向资金环；交互方向单一，资金不可能回流",
+                status=EvidenceStatus.INSUFFICIENT,
+                gap_code="SINGLE_DIRECTION_ONLY",
+                gap_detail=(
+                    f"地址 {address} 只有{'出账' if has_out else '入账'}方向交易，"
+                    "样本方向单一，缺少回流路径，无法据此排除环形流转"
+                ),
+            )
+        return self._evidence(
+            FactorCode.RING_FLOW, False, 0.0,
+            "未检测到经过该地址的有向资金环",
+            related=tuple(sorted(self._out.get(address, set()) | self._inn.get(address, set()))),
         )
 
     def _find_cycle_through(self, address: str) -> list[str] | None:
@@ -168,15 +272,37 @@ class FactorCalculator:
                 f" 秒窗口内发生 {worst} 笔交互（阈值>={self.HIGH_FREQ_COUNT}），"
                 "属短时高频交互"
             )
-        else:
-            detail = (
-                f"最长窗口交互笔数={worst}，未达高频阈值{self.HIGH_FREQ_COUNT}"
+            return self._evidence(
+                FactorCode.HIGH_FREQ_INTERACTION, True, self.WEIGHT_HIGH_FREQ, detail,
             )
-        return FactorEvidence(
-            code=FactorCode.HIGH_FREQ_INTERACTION,
-            triggered=hit,
-            weight=self.WEIGHT_HIGH_FREQ if hit else 0.0,
-            detail=detail,
+        detail = (
+            f"最长窗口交互笔数={worst}，未达高频阈值{self.HIGH_FREQ_COUNT}"
+        )
+        n = len(times)
+        if n == 0:
+            return self._evidence(
+                FactorCode.HIGH_FREQ_INTERACTION, False, 0.0,
+                f"{detail}；该地址无任何带时间戳的交互，本维度完全无数据",
+                status=EvidenceStatus.NO_DATA,
+                gap_code="NO_INTERACTION",
+                gap_detail=f"地址 {address} 无任何交互记录，无法评估短时高频",
+            )
+        span = times[-1] - times[0]
+        if n < self.HIGH_FREQ_COUNT and span < self.HIGH_FREQ_MIN_SPAN:
+            return self._evidence(
+                FactorCode.HIGH_FREQ_INTERACTION, False, 0.0,
+                f"{detail}；仅 {n} 笔交互、时间跨度 {span:.0f} 秒，不足一个判定窗口",
+                status=EvidenceStatus.INSUFFICIENT,
+                gap_code="TIME_SPAN_TOO_SHORT",
+                gap_detail=(
+                    f"仅有 {n} 笔交互（阈值需 {self.HIGH_FREQ_COUNT} 笔），"
+                    f"时间跨度 {span:.0f} 秒，未覆盖一个 "
+                    f"{self.HIGH_FREQ_MIN_SPAN:.0f} 秒判定窗口，"
+                    "观测时长不足，不能排除短时高频"
+                ),
+            )
+        return self._evidence(
+            FactorCode.HIGH_FREQ_INTERACTION, False, 0.0, detail,
         )
 
     def high_risk_direct(self, address: str) -> FactorEvidence:
@@ -186,30 +312,57 @@ class FactorCalculator:
         hit = bool(direct)
         if hit:
             detail = f"与已知高风险地址存在直接资金往来：{', '.join(direct)}"
-        else:
-            detail = "未发现与已知高风险地址的直接资金往来"
-        return FactorEvidence(
-            code=FactorCode.HIGH_RISK_DIRECT,
-            triggered=hit,
-            weight=self.WEIGHT_HIGH_RISK_DIRECT if hit else 0.0,
-            detail=detail,
-            related=tuple(direct),
+            return self._evidence(
+                FactorCode.HIGH_RISK_DIRECT, True, self.WEIGHT_HIGH_RISK_DIRECT,
+                detail, related=tuple(direct),
+            )
+        n = len(neighbors)
+        detail = "未发现与已知高风险地址的直接资金往来"
+        if n == 0:
+            return self._evidence(
+                FactorCode.HIGH_RISK_DIRECT, False, 0.0,
+                f"{detail}；该地址没有任何对手方，本维度完全无数据",
+                status=EvidenceStatus.NO_DATA,
+                gap_code="NO_COUNTERPARTY",
+                gap_detail=f"地址 {address} 无任何交易对手方，无法评估直接高风险关联",
+            )
+        if n < self.HIGH_RISK_DIRECT_MIN_COUNTERPARTIES:
+            return self._evidence(
+                FactorCode.HIGH_RISK_DIRECT, False, 0.0,
+                f"{detail}；仅观察到 {n} 个对手方，缺少应有的对手方覆盖",
+                status=EvidenceStatus.INSUFFICIENT,
+                gap_code="TOO_FEW_COUNTERPARTIES",
+                gap_detail=(
+                    f"仅观察到 {n} 个不同直接对手方（充分口径需 "
+                    f"{self.HIGH_RISK_DIRECT_MIN_COUNTERPARTIES} 个），"
+                    "对手方覆盖不足，不能排除与高风险地址直接往来"
+                ),
+                related=tuple(sorted(neighbors)),
+            )
+        return self._evidence(
+            FactorCode.HIGH_RISK_DIRECT, False, 0.0, detail,
+            related=tuple(sorted(neighbors)),
         )
 
     def high_risk_indirect(self, address: str) -> FactorEvidence:
         """与已知高风险地址 2 跳间接关联（直接命中的不计入本因子）。"""
-        direct = (self._out.get(address, set()) | self._inn.get(address, set())) & self._high_risk
-        indirect: dict[str, int] = {}
-        for hops in (2,):
-            frontier_out = set()
-            frontier_in = set()
-            for a in (self._out.get(address, set()) | self._inn.get(address, set())):
-                frontier_out |= self._out.get(a, set())
-                frontier_in |= self._inn.get(a, set())
-            reachable = frontier_out | frontier_in
-            for h in reachable:
-                if h != address and h in self._high_risk and h not in direct:
-                    indirect[h] = hops
+        one_hop = self._out.get(address, set()) | self._inn.get(address, set())
+        direct = one_hop & self._high_risk
+        frontier_out = set()
+        frontier_in = set()
+        intermediaries: set[str] = set()
+        for a in one_hop:
+            beyond_out = self._out.get(a, set()) - {address}
+            beyond_in = self._inn.get(a, set()) - {address}
+            if beyond_out or beyond_in:
+                intermediaries.add(a)
+            frontier_out |= self._out.get(a, set())
+            frontier_in |= self._inn.get(a, set())
+        reachable = frontier_out | frontier_in
+        indirect = {
+            h for h in reachable
+            if h != address and h in self._high_risk and h not in direct
+        }
         names = sorted(indirect)
         hit = bool(names)
         if hit:
@@ -217,12 +370,33 @@ class FactorCalculator:
                 f"经 1 个中间地址后与高风险地址关联（{self.INDIRECT_MAX_HOPS} 跳内）："
                 f"{', '.join(names)}"
             )
-        else:
-            detail = f"{self.INDIRECT_MAX_HOPS} 跳内未发现间接高风险关联"
-        return FactorEvidence(
-            code=FactorCode.HIGH_RISK_INDIRECT,
-            triggered=hit,
-            weight=self.WEIGHT_HIGH_RISK_INDIRECT if hit else 0.0,
-            detail=detail,
-            related=tuple(names),
+            return self._evidence(
+                FactorCode.HIGH_RISK_INDIRECT, True, self.WEIGHT_HIGH_RISK_INDIRECT,
+                detail, related=tuple(names),
+            )
+        detail = f"{self.INDIRECT_MAX_HOPS} 跳内未发现间接高风险关联"
+        if not one_hop:
+            return self._evidence(
+                FactorCode.HIGH_RISK_INDIRECT, False, 0.0,
+                f"{detail}；该地址没有任何对手方，本维度完全无数据",
+                status=EvidenceStatus.NO_DATA,
+                gap_code="NO_COUNTERPARTY",
+                gap_detail=f"地址 {address} 无任何交易对手方，无法评估间接高风险关联",
+            )
+        if len(intermediaries) < self.INDIRECT_MIN_INTERMEDIARIES:
+            return self._evidence(
+                FactorCode.HIGH_RISK_INDIRECT, False, 0.0,
+                f"{detail}；{len(one_hop)} 个一跳对手方均无后续往来，2 跳路径展不开",
+                status=EvidenceStatus.INSUFFICIENT,
+                gap_code="NO_TWO_HOP_PATH",
+                gap_detail=(
+                    f"观察到 {len(one_hop)} 个一跳对手方，但没有任何对手方存在"
+                    f"绕过 {address} 的后续交易，缺少 2 跳路径，"
+                    "无法据此排除间接高风险关联"
+                ),
+                related=tuple(sorted(one_hop)),
+            )
+        return self._evidence(
+            FactorCode.HIGH_RISK_INDIRECT, False, 0.0, detail,
+            related=tuple(sorted(intermediaries)),
         )

@@ -45,6 +45,10 @@ def _risk_to_dict(r: RiskScore) -> dict:
                 "weight": f.weight,
                 "detail": f.detail,
                 "related": list(f.related),
+                # 新增：维度级证据状态与缺证据原因（不改动原有字段）
+                "evidence_status": f.evidence_status.value,
+                "gap_code": f.gap_code,
+                "gap_detail": f.gap_detail,
             }
             for f in r.factors
         ],
@@ -53,6 +57,29 @@ def _risk_to_dict(r: RiskScore) -> dict:
         ],
         "evaluated_at_block": r.evaluated_at_block,
         "determinism_key": r.determinism_key,
+        # 新增：完整度汇总与逐维度“下不了结论”原因
+        "completeness": (
+            {
+                "total_dimensions": r.completeness.total_dimensions,
+                "evaluated_dimensions": r.completeness.evaluated_dimensions,
+                "coverage_ratio": r.completeness.coverage_ratio,
+                "confidence": r.completeness.confidence.value,
+                "missing_dimensions": [
+                    {
+                        "code": g.code.value,
+                        "evidence_status": g.evidence_status.value,
+                        "gap_code": g.gap_code,
+                        "gap_detail": g.gap_detail,
+                    }
+                    for g in r.completeness.missing_dimensions
+                ],
+            }
+            if r.completeness is not None
+            else None
+        ),
+        "inconclusive_reasons": [
+            {"code": x.code, "detail": x.detail} for x in r.inconclusive_reasons
+        ],
     }
 
 

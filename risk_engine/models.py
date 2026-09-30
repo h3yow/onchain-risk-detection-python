@@ -25,6 +25,25 @@ class FactorCode(str, Enum):
     HIGH_RISK_INDIRECT = "HIGH_RISK_INDIRECT"    # 与高风险地址间接关联
 
 
+class EvidenceStatus(str, Enum):
+    """单个风险维度的证据充分程度。
+
+    SUFFICIENT    证据充分，触发/未触发结论都可采信（“查过了确实没问题”）
+    INSUFFICIENT  有观测数据但不足以判定（样本方向单一/对手方不足/跨度不够…）
+    NO_DATA       该维度完全没有可看的数据（“没查出来问题”，不能当作安全）
+    """
+    SUFFICIENT = "SUFFICIENT"
+    INSUFFICIENT = "INSUFFICIENT"
+    NO_DATA = "NO_DATA"
+
+
+class ConfidenceLevel(str, Enum):
+    """整体评估完整度（可信度）档位。"""
+    HIGH = "HIGH"    # 绝大多数维度可评估
+    MEDIUM = "MEDIUM"  # 达到最低可判定覆盖
+    LOW = "LOW"      # 可评估维度太少，结论不可采信
+
+
 @dataclass(frozen=True)
 class Wallet:
     address: str
@@ -61,6 +80,30 @@ class FactorEvidence:
     weight: float            # 该因子贡献分值（0 表示未触发）
     detail: str              # 人可读的判定依据
     related: tuple[str, ...] = ()
+    # 维度级证据状态：证据充分 / 有观测但不足 / 完全无数据
+    evidence_status: EvidenceStatus = EvidenceStatus.SUFFICIENT
+    # 证据不足或缺数据时，具体缺什么（稳定代码 + 人可读说明）；充分时为 None
+    gap_code: str | None = None
+    gap_detail: str | None = None
+
+
+@dataclass(frozen=True)
+class DimensionGap:
+    """本次没评上的维度及其缺证据原因。"""
+    code: FactorCode
+    evidence_status: EvidenceStatus
+    gap_code: str
+    gap_detail: str
+
+
+@dataclass(frozen=True)
+class Completeness:
+    """本次评估的完整度汇总：结论由几个维度支撑、哪些没评上、可信度如何。"""
+    total_dimensions: int                 # 风险维度总数（固定为 6）
+    evaluated_dimensions: int             # 证据充分、真正参与结论支撑的维度数
+    coverage_ratio: float                 # evaluated / total，取值 [0, 1]
+    confidence: ConfidenceLevel           # 整体可信度档位
+    missing_dimensions: tuple[DimensionGap, ...]  # 没评上的维度及逐条原因
 
 
 @dataclass(frozen=True)
@@ -86,6 +129,10 @@ class RiskScore:
     insufficient_reasons: tuple[Insufficiency, ...]
     evaluated_at_block: int
     determinism_key: str  # 输入指纹，保证同输入同结论
+    # 维度级证据状态与完整度汇总（新增字段，向后兼容，不改动任何原有字段）
+    completeness: Completeness | None = None
+    # 下不了结论时逐条列出的维度级原因（与 insufficient_reasons 并存）
+    inconclusive_reasons: tuple[Insufficiency, ...] = ()
 
 
 @dataclass(frozen=True)

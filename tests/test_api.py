@@ -53,3 +53,39 @@ def test_ledger_endpoint_consistent(client):
     r = client.get("/ledger")
     assert r.status_code == 200
     assert set(r.json()) >= {"balances", "nonces", "last_block", "tx_count"}
+
+
+def test_risk_response_is_backward_compatible_and_rich(client):
+    # 原有字段全部保留，新增维度证据状态与完整度汇总
+    payload = _tx(tid="rich-tx", from_addr="RICH_A", to_addr="RICH_B")
+    client.post("/transactions", json=payload)
+    r = client.get("/risk/RICH_A")
+    assert r.status_code == 200
+    body = r.json()
+
+    # 原有字段不删不改
+    assert set(body) >= {
+        "address", "score", "level", "factors",
+        "insufficient_reasons", "evaluated_at_block", "determinism_key",
+    }
+    assert body["level"] == "UNKNOWN"  # 低信息账户不得给分级
+    factor = body["factors"][0]
+    assert set(factor) >= {"code", "triggered", "weight", "detail", "related"}
+    # 新增的维度级字段
+    assert factor["evidence_status"] in {"SUFFICIENT", "INSUFFICIENT", "NO_DATA"}
+    assert "gap_code" in factor and "gap_detail" in factor
+
+    comp = body["completeness"]
+    assert set(comp) == {
+        "total_dimensions", "evaluated_dimensions", "coverage_ratio",
+        "confidence", "missing_dimensions",
+    }
+    assert comp["total_dimensions"] == 6
+    assert comp["evaluated_dimensions"] + len(comp["missing_dimensions"]) == 6
+    assert comp["confidence"] in {"HIGH", "MEDIUM", "LOW"}
+    missing = comp["missing_dimensions"][0]
+    assert set(missing) == {"code", "evidence_status", "gap_code", "gap_detail"}
+
+    assert body["inconclusive_reasons"], "覆盖不足时必须逐条给出下不了结论的原因"
+    codes = {x["code"] for x in body["inconclusive_reasons"]}
+    assert "INSUFFICIENT_DIMENSION_COVERAGE" in codes

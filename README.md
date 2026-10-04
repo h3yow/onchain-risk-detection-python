@@ -74,12 +74,14 @@ curl -s localhost:8000/risk/A
 | `INSUFFICIENT` | 有观测数据，但覆盖面不足以下结论 | **不**计入支撑维度，附 `gap_code` 说明缺什么 |
 | `NO_DATA` | 该维度完全没有相关数据 | **不**计入支撑维度，附 `gap_code` 说明缺什么 |
 
-未触发时各维度“证据充分”的具体口径（触发一律算充分）：
+未触发时各维度“证据充分”的具体口径（触发一律算充分）。注意汇聚/分散的
+“排除”口径与**触发阈值解耦**：触发看“不同来源/目标数是否达标”，排除看
+“该方向上的观测面是否足够宽”，因此「未触发但证据充分」是实际可达的状态：
 
 | 因子 | 未触发即充分（可安全放行）的口径 | 常见 INSUFFICIENT 的 `gap_code` |
 | --- | --- | --- |
-| `FUND_CONVERGENCE` | 不同入账来源 ≥ 3 | `TOO_FEW_INCOMING_SOURCES`（来源面太窄）；无入账为 `NO_INCOMING_TX`(NO_DATA) |
-| `FUND_DISPERSION` | 不同出账目标 ≥ 3 | `TOO_FEW_OUTGOING_TARGETS`；无出账为 `NO_OUTGOING_TX`(NO_DATA) |
+| `FUND_CONVERGENCE` | 入账方向观测面足够宽：不同入账来源 ≥ 2（方向不单一）**且**入账笔数 ≥ 3（样本量够）**且**入账观测时间跨度 ≥ 5 秒（覆盖一个判定窗口），三者同时满足仍未达汇聚阈值 | `TOO_FEW_INCOMING_SOURCES`（来源单一）；`TOO_FEW_INCOMING_TX`（笔数太窄）；`INCOMING_SPAN_TOO_SHORT`（跨度不足一个窗口）；无入账为 `NO_INCOMING_TX`(NO_DATA) |
+| `FUND_DISPERSION` | 出账方向观测面足够宽：不同出账目标 ≥ 2 **且**出账笔数 ≥ 3 **且**出账观测时间跨度 ≥ 5 秒，三者同时满足仍未达分散阈值 | `TOO_FEW_OUTGOING_TARGETS`（目标单一）；`TOO_FEW_OUTGOING_TX`（笔数太窄）；`OUTGOING_SPAN_TOO_SHORT`（跨度不足）；无出账为 `NO_OUTGOING_TX`(NO_DATA) |
 | `RING_FLOW` | 入账、出账两个方向都有交易，图中仍无经过该地址的环 | `SINGLE_DIRECTION_ONLY`（样本方向单一，资金不可能回流）；无交易为 `NO_PARTICIPATION`(NO_DATA) |
 | `HIGH_FREQ_INTERACTION` | 交互时间跨度已覆盖 ≥ 1 个 5 秒判定窗口 | `TIME_SPAN_TOO_SHORT`（笔数少且跨度不足一个窗口）；无交互为 `NO_INTERACTION`(NO_DATA) |
 | `HIGH_RISK_DIRECT` | 不同直接对手方 ≥ 2 且均非高风险 | `TOO_FEW_COUNTERPARTIES`（缺少应有的对手方覆盖）；无对手方为 `NO_COUNTERPARTY`(NO_DATA) |
@@ -172,6 +174,14 @@ curl -s localhost:8000/risk/A
   证据覆盖面不足的地址（如合成数据里的 `R`、`F`）级别会从原先的分级
   变成 `UNKNOWN`，这正是“低信息不得看似无风险”的预期行为；证据充分的
   地址（`H/X/VIC/MID/U/CLEAN`）分级保持不变。
+- 本轮（汇聚/分散充分口径修正）同样只做行为补全、不改任何字段：此前
+  `FUND_CONVERGENCE` / `FUND_DISPERSION` 的“未触发即充分”口径与触发阈值
+  相同（≥ 3），该分支实际不可达，两个维度未触发时永远只会是
+  `INSUFFICIENT`/`NO_DATA`。修正后排除口径与触发阈值解耦（来源/目标
+  不单一 + 样本笔数够 + 时间跨度够），观测面足够的地址这两个维度会如实
+  从 `INSUFFICIENT` 升为 `SUFFICIENT`，`evaluated_dimensions` 与
+  `coverage_ratio` 只可能因此上升；未触发维度分值仍为 0，触发阈值、
+  权重与分级门槛均未改动，原本能给出 `HIGH/MEDIUM/LOW` 的账户结论不变。
 
 ## 测试与日志
 
@@ -194,6 +204,17 @@ uv run pytest tests/test_concurrency.py
     明确 `LOW`、逐维度原因同步更新，并与一次性按序录入结果逐字段相等；
   - 8 线程并发重复补录同一批只算一次，补录全程的查询只见批次边界状态、
     结论与依据始终自洽。
+- `tests/test_negative_evidence.py`（汇聚/分散「查过了确实没问题」专测）：
+  - 未触发但观测面足够（来源/目标不单一 + 笔数够 + 跨度够）时，
+    `FUND_CONVERGENCE` / `FUND_DISPERSION` 可达 `SUFFICIENT` 且分值仍为 0；
+  - 同一份报告里 `SUFFICIENT / INSUFFICIENT / NO_DATA` 三档同时出现、
+    可区分，「没查出来」与「查过了没问题」不混淆；
+  - 边界卡准：来源单一（`TOO_FEW_INCOMING_SOURCES`）、笔数太窄
+    （`TOO_FEW_INCOMING_TX`）、跨度不足（`INCOMING_SPAN_TOO_SHORT`）、
+    完全无数据（`NO_INCOMING_TX`）各归各档，出账侧同理；
+  - 乱序补录历史交易后两个维度由 `INSUFFICIENT` 升 `SUFFICIENT`、
+    完整度单调不降、`UNKNOWN` 翻成明确 `LOW`，与一次性按序录入逐字段相等；
+  - 8 线程并发重复补录全程查询只见批次边界、结论与依据自洽。
 - `tests/test_concurrency.py`：并发摄入等价串行、整批原子、并发评估稳定。
 - `tests/test_api.py`：HTTP 状态码归类（409/422）、响应结构，以及本轮
   新增的字段向后兼容检查（老字段不丢、新字段齐全、UNKNOWN 门禁）。
@@ -219,16 +240,18 @@ risk_engine/
   synthetic.py  # 确定性合成钱包/交易/到达顺序/冲突样本
   api.py        # FastAPI 路由与错误归类（含 completeness 等新字段）
 tests/          # pytest 用例（流水与判定依据写日志）
-  test_completeness.py # 低信息保护、维度缺口可区分、补录重判、并发补录一致
+  test_completeness.py    # 低信息保护、维度缺口可区分、补录重判、并发补录一致
+  test_negative_evidence.py # 汇聚/分散「未触发但证据充分」档位、边界与补录重判
 scripts/demo.py # 本地端到端演示
 ```
 
 ## 本地怎么验证新能力
 
 ```bash
-uv run pytest tests/test_completeness.py -q   # 只看本轮新增的证据/补录用例
-uv run pytest -q                              # 全量回归（28 个用例，老用例不回归）
-uv run python scripts/demo.py                 # 观察决策行的 coverage=x/6 与 confidence
+uv run pytest tests/test_completeness.py -q      # 证据充分度/完整度/补录用例
+uv run pytest tests/test_negative_evidence.py -q # 汇聚/分散「查过了确实没问题」专测
+uv run pytest -q                                 # 全量回归（33 个用例，老用例不回归）
+uv run python scripts/demo.py                    # 观察决策行的 coverage=x/6 与 confidence
 ```
 
 也可起服务后手工验证低信息账户与补录过程：
@@ -245,4 +268,15 @@ curl -s -X POST localhost:8000/transactions -H 'content-type: application/json' 
 curl -s -X POST localhost:8000/transactions -H 'content-type: application/json' \
   -d '{"tx_id":"s2","from_addr":"S2","to_addr":"W","amount":6,"block_height":1,"block_index":1,"timestamp":11}'
 curl -s localhost:8000/risk/W | python -m json.tool
+# 3) 观测面充分但不触发：入账 3 笔 2 来源、出账 3 笔 2 目标、跨度都够 ->
+#    FUND_CONVERGENCE / FUND_DISPERSION 的 evidence_status 升为 SUFFICIENT，分值仍为 0
+for t in '{"tx_id":"o1","from_addr":"S1","to_addr":"OBS","amount":5,"block_height":1,"block_index":0,"timestamp":100}' \
+         '{"tx_id":"o2","from_addr":"S2","to_addr":"OBS","amount":6,"block_height":2,"block_index":0,"timestamp":110}' \
+         '{"tx_id":"o3","from_addr":"S1","to_addr":"OBS","amount":7,"block_height":3,"block_index":0,"timestamp":120}' \
+         '{"tx_id":"o4","from_addr":"OBS","to_addr":"D1","amount":4,"block_height":4,"block_index":0,"timestamp":130}' \
+         '{"tx_id":"o5","from_addr":"OBS","to_addr":"D2","amount":3,"block_height":5,"block_index":0,"timestamp":140}' \
+         '{"tx_id":"o6","from_addr":"OBS","to_addr":"D1","amount":2,"block_height":6,"block_index":0,"timestamp":150}'; do
+  curl -s -X POST localhost:8000/transactions -H 'content-type: application/json' -d "$t" > /dev/null
+done
+curl -s localhost:8000/risk/OBS | python -m json.tool
 ```

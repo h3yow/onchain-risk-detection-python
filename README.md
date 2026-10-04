@@ -2,9 +2,10 @@
 
 用**本地合成**的钱包与交易数据模拟链上活动，提供交易摄入、区块顺序回放、
 幂等去重、冲突检测与基于可解释因子的风险评分。所有结论确定性可复现，
-并发摄入的结果与逐个串行处理完全一致。自本轮起每个风险维度还会单独标注
+并发摄入的结果与逐个串行处理完全一致。每个风险维度都会单独标注
 **证据充分程度**，并给出本次评估的**完整度汇总**：可评估维度太少时只给
-“下不了结论”（`UNKNOWN`），绝不把“没查出问题”误报成低风险。
+“下不了结论”（`UNKNOWN`），绝不把“没查出问题”误报成低风险；观测面足以
+排除某形态时则如实给“查过了确实没问题”（`SUFFICIENT`），两种状态严格分开。
 
 - 运行时：Python 3.14 / FastAPI，纯内存存储，无需外部依赖
 - 包：`risk_engine/`，测试：`tests/`，演示：`scripts/demo.py`
@@ -44,6 +45,10 @@ curl -s localhost:8000/risk/A
 | --- | --- | --- | --- |
 | `FUND_CONVERGENCE` | 资金汇聚：不同来源向该地址转入 | 入账来源数 ≥ 3 | 25 |
 | `FUND_DISPERSION` | 资金分散：该地址向不同目标转出 | 出账目标数 ≥ 3 | 20 |
+
+> 触发阈值（≥3，决定分数）与“未触发证据充分”口径（对手方 ≥2 **且** 双向有
+> 观测 **且** 跨度 ≥5 秒，只决定证据状态、不带分）是两套独立边界，见下文
+> “维度级证据判定口径”。
 | `RING_FLOW` | 环形流转：有向资金图中经过该地址的环 | 存在环（给出最短环路径） | 30 |
 | `HIGH_FREQ_INTERACTION` | 短时高频交互 | 5 秒滑动窗口内 ≥ 4 笔 | 15 |
 | `HIGH_RISK_DIRECT` | 与已知高风险地址直接资金往来（双向 1 跳） | 存在即触发 | 30 |
@@ -76,14 +81,23 @@ curl -s localhost:8000/risk/A
 
 未触发时各维度“证据充分”的具体口径（触发一律算充分）：
 
-| 因子 | 未触发即充分（可安全放行）的口径 | 常见 INSUFFICIENT 的 `gap_code` |
+| 因子 | 未触发即充分（可安全放行）的口径 | 常见 INSUFFICIENT / NO_DATA 的 `gap_code` |
 | --- | --- | --- |
-| `FUND_CONVERGENCE` | 不同入账来源 ≥ 3 | `TOO_FEW_INCOMING_SOURCES`（来源面太窄）；无入账为 `NO_INCOMING_TX`(NO_DATA) |
-| `FUND_DISPERSION` | 不同出账目标 ≥ 3 | `TOO_FEW_OUTGOING_TARGETS`；无出账为 `NO_OUTGOING_TX`(NO_DATA) |
+| `FUND_CONVERGENCE` | **同时满足**：不同入账来源 ≥ 2（严格小于触发阈值 3，故未触发）、该账户出账方向也有交易（方向不单一）、参与交易时间跨度 ≥ 5 秒 | `TOO_FEW_INCOMING_SOURCES`（来源面太窄）、`SINGLE_DIRECTION_ONLY`（只有入账没有出账）、`OBSERVATION_SPAN_TOO_SHORT`（双向/来源都够但跨度不足一个窗口）；无入账为 `NO_INCOMING_TX`(NO_DATA) |
+| `FUND_DISPERSION` | **同时满足**：不同出账目标 ≥ 2（严格小于触发阈值 3，故未触发）、该账户入账方向也有交易（方向不单一）、参与交易时间跨度 ≥ 5 秒 | `TOO_FEW_OUTGOING_TARGETS`、`SINGLE_DIRECTION_ONLY`（只有出账没有入账）、`OBSERVATION_SPAN_TOO_SHORT`；无出账为 `NO_OUTGOING_TX`(NO_DATA) |
 | `RING_FLOW` | 入账、出账两个方向都有交易，图中仍无经过该地址的环 | `SINGLE_DIRECTION_ONLY`（样本方向单一，资金不可能回流）；无交易为 `NO_PARTICIPATION`(NO_DATA) |
 | `HIGH_FREQ_INTERACTION` | 交互时间跨度已覆盖 ≥ 1 个 5 秒判定窗口 | `TIME_SPAN_TOO_SHORT`（笔数少且跨度不足一个窗口）；无交互为 `NO_INTERACTION`(NO_DATA) |
 | `HIGH_RISK_DIRECT` | 不同直接对手方 ≥ 2 且均非高风险 | `TOO_FEW_COUNTERPARTIES`（缺少应有的对手方覆盖）；无对手方为 `NO_COUNTERPARTY`(NO_DATA) |
 | `HIGH_RISK_INDIRECT` | 至少 1 个一跳对手方还存在绕过本地址的后续交易（2 跳路径展得开），2 跳内仍无高风险 | `NO_TWO_HOP_PATH`（对手方都没有后续往来）；无对手方为 `NO_COUNTERPARTY`(NO_DATA) |
+
+> 注意资金汇聚/分散这两行的口径是一个**合取**：对手方面、双向覆盖、时间跨度
+> 三条边界**全部满足**才算“查过了确实没问题”；任何一条不满足都只能标
+> `INSUFFICIENT` 并用对应的 `gap_code` 讲清缺什么，该方向完全没有交易则是
+> `NO_DATA`。由于充分口径要求的对手方数（≥2）严格低于触发阈值（≥3），
+> “未触发但证据充分”这一档是**真实可达**的（典型场景：账户双向都活跃、
+> 被观察了足够久，但每个方向只见 2 个不同对手方，如合成数据补录后的 `W`）。
+> 未触发时该因子的权重严格为 0，充分口径只影响 `evidence_status` 与完整度，
+> 不会改变风险分数与 HIGH/MEDIUM/LOW 分级门槛。
 
 ### 完整度汇总怎么看
 
@@ -110,7 +124,9 @@ curl -s localhost:8000/risk/A
 
 - 迟到/乱序的历史交易落入索引后，下一次评估时之前“样本不足”的维度会按
   新证据自动重评；覆盖一旦抬过 3/6 判定线，级别会从 `UNKNOWN` 翻成明确的
-  `LOW/MEDIUM/HIGH`，逐维度 `gap_*` 原因同步消失或更新。
+  `LOW/MEDIUM/HIGH`，逐维度 `gap_*` 原因同步消失或更新。资金汇聚/分散也会
+  在双向覆盖与时间跨度被历史补录补齐后，从 `INSUFFICIENT`/`NO_DATA` 翻成
+  `SUFFICIENT`（未触发，分值仍为 0），而仍不满足边界的维度继续挂对应缺口。
 - **同输入同输出**：数据没变时反复评估，级别、分数、因子、`completeness`
   与 `determinism_key` 完全一致（dataclass 相等）。
 - **完整度单调不降**：证据只会随历史补录增多，`evaluated_dimensions` 与
@@ -168,10 +184,17 @@ curl -s localhost:8000/risk/A
 - `factors[]` 每项保留 `code/triggered/weight/detail/related`；新增
   `evidence_status`（`SUFFICIENT/INSUFFICIENT/NO_DATA`）、`gap_code`、
   `gap_detail`（充分时后两者为 `null`）。
-- 旧客户端可继续只读老字段；需要注意的**唯一语义变化**：在新口径下，
-  证据覆盖面不足的地址（如合成数据里的 `R`、`F`）级别会从原先的分级
-  变成 `UNKNOWN`，这正是“低信息不得看似无风险”的预期行为；证据充分的
-  地址（`H/X/VIC/MID/U/CLEAN`）分级保持不变。
+- 旧客户端可继续只读老字段；需要注意的语义变化只有两处，且都不改动分数与
+  触发集合：
+  1. 证据覆盖面不足的地址（如合成数据里的 `R`、`F`）级别会是 `UNKNOWN`，
+     这正是“低信息不得看似无风险”的预期行为；证据充分的地址
+     （`H/X/VIC/MID/U/CLEAN`）HIGH/MEDIUM/LOW 分级保持不变。
+  2. 资金汇聚/分散修正了“未触发充分档不可达”的口径偏差：当账户在某方向上
+     已观测 ≥2 个不同对手方、双向都有交易、时间跨度 ≥5 秒却未触发时，
+     该维度由原先的 `INSUFFICIENT` 修正为 `SUFFICIENT`（如 `VIC` 的汇聚维，
+     其完整度 4/6 → 5/6、MEDIUM 不变）。这只抬升完整度、从不抬分：未触发时
+     `weight` 恒为 0，HIGH/MEDIUM/LOW 门槛、既有接口字段与已触发分级结论
+     都不受影响；完整度因此只会升、不会降。
 
 ## 测试与日志
 
@@ -185,15 +208,26 @@ uv run pytest tests/test_concurrency.py
   迟到历史交易回放、非法输入归类。
 - `tests/test_scoring.py`：六因子触发集合与依据文本、阈值分级、
   数据不足返回 UNKNOWN、空账本、确定性指纹。
-- `tests/test_completeness.py`（本轮新增）：
+- `tests/test_completeness.py`（证据充分度/完整度汇总）：
   - 低信息账户（只有 2 笔同向交易、以及从未出现的地址）只能得 `UNKNOWN`，
     且 `inconclusive_reasons` 逐条列出覆盖门禁原因与每个维度缺口；
   - 同一报告中 `SUFFICIENT / INSUFFICIENT / NO_DATA` 三种状态与六种
     `gap_code` 可区分，缺口说明都讲清“缺什么”；
-  - 乱序补录历史交易后完整度**单调不降**、覆盖过线后 `UNKNOWN` 自动翻成
-    明确 `LOW`、逐维度原因同步更新，并与一次性按序录入结果逐字段相等；
+  - **资金汇聚/分散“未触发但证据充分”档可达**：账户双向都活跃、时间跨度够，
+    但每个方向只有 2 个不同对手方（严格低于触发阈值 3）时，两维都如实给
+    `SUFFICIENT`（“查过了确实没问题”），且 `triggered=false / weight=0`，
+    分数不受影响（`test_flow_dimensions_negative_sufficient_tier_is_reachable`）；
+  - **边界缺口分开、不放宽**：来源/目标仅 1 个（`TOO_FEW_*`）、方向单一
+    （`SINGLE_DIRECTION_ONLY`）、双向都有但跨度 <5 秒
+    （`OBSERVATION_SPAN_TOO_SHORT`）、该方向无交易（`NO_DATA`）分别如实标注，
+    不会为档位好看而抬成充分（`test_flow_dimension_gaps_are_split_by_boundary`）；
+  - **补录重判**：乱序补录历史交易后完整度**单调不降**，汇聚/分散从
+    `INSUFFICIENT/NO_DATA` 翻成 `SUFFICIENT`（分值始终为 0），覆盖过线后
+    `UNKNOWN` 自动翻成明确 `LOW`，逐维度原因同步更新，并与一次性按序录入
+    逐字段相等（`test_backfill_lifts_flow_dimensions_to_sufficient_without_score`
+    与 `test_backfill_history_raises_completeness_and_redecides`）；
   - 8 线程并发重复补录同一批只算一次，补录全程的查询只见批次边界状态、
-    结论与依据始终自洽。
+    结论与依据始终自洽（`test_concurrent_backfill_queries_stay_consistent`）。
 - `tests/test_concurrency.py`：并发摄入等价串行、整批原子、并发评估稳定。
 - `tests/test_api.py`：HTTP 状态码归类（409/422）、响应结构，以及本轮
   新增的字段向后兼容检查（老字段不丢、新字段齐全、UNKNOWN 门禁）。
@@ -226,10 +260,18 @@ scripts/demo.py # 本地端到端演示
 ## 本地怎么验证新能力
 
 ```bash
-uv run pytest tests/test_completeness.py -q   # 只看本轮新增的证据/补录用例
-uv run pytest -q                              # 全量回归（28 个用例，老用例不回归）
+uv run pytest tests/test_completeness.py -q   # 证据/补录/边界用例（7 个）
+uv run pytest -q                              # 全量回归（31 个用例，老用例不回归）
 uv run python scripts/demo.py                 # 观察决策行的 coverage=x/6 与 confidence
 ```
+
+跑用例时日志按业务归类，能直接看出覆盖了哪些场景：
+
+- `INGEST-STREAM`：逐笔输入流水（初始/补录/乱序/并发批次）；
+- `DECISION / FACTOR`：每个被评估地址的级别、总分、完整度与逐因子证据状态；
+- `MISSING-DIM / INCONCLUSIVE`：没评上的维度缺口与下不了结论的逐条原因。
+其中汇聚/分散两维在充分时打印 `evidence=SUFFICIENT gap=-`，不足时会带
+`TOO_FEW_* / SINGLE_DIRECTION_ONLY / OBSERVATION_SPAN_TOO_SHORT` 等缺口码。
 
 也可起服务后手工验证低信息账户与补录过程：
 

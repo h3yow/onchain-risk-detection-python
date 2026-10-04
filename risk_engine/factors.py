@@ -31,8 +31,14 @@ class FactorCalculator:
     # 未触发时，只有观测面覆盖到“足以排除”的程度才算证据充分（可安全放行）；
     # 有观测但覆盖面不足 -> INSUFFICIENT，并给出具体缺什么；
     # 完全没有相关数据 -> NO_DATA。
-    CONVERGENCE_NEGATIVE_MIN_SOURCES = 3   # 入账方向上至少看过 3 个不同来源
-    DISPERSION_NEGATIVE_MIN_TARGETS = 3    # 出账方向上至少看过 3 个不同目标
+    # 资金汇聚/分散的“未触发也充分”必须同时满足三个边界条件：
+    #   a) 该方向已见过足够多的不同对手方（严格小于触发阈值，使该档可达）；
+    #   b) 两个方向都有观测（方向不单一，资金进出全貌都看过）；
+    #   c) 参与交易的时间跨度足以覆盖一个判定窗口。
+    # 任一条不满足都只能算证据不足，并指出具体缺什么。
+    CONVERGENCE_NEGATIVE_MIN_SOURCES = 2   # 入账方向上至少看过 2 个不同来源（< 触发阈值 3）
+    DISPERSION_NEGATIVE_MIN_TARGETS = 2    # 出账方向上至少看过 2 个不同目标（< 触发阈值 3）
+    FLOW_NEGATIVE_MIN_SPAN = 5.0           # 资金流维度观测时间跨度下限（秒，≥一个判定窗口）
     HIGH_RISK_DIRECT_MIN_COUNTERPARTIES = 2  # 至少见过 2 个不同直接对手方
     HIGH_FREQ_MIN_SPAN = 5.0               # 观测时间跨度至少覆盖一个判定窗口
     INDIRECT_MIN_INTERMEDIARIES = 1        # 至少存在 1 个可展开 2 跳的中间地址
@@ -58,6 +64,17 @@ class FactorCalculator:
             self.high_risk_direct(address),
             self.high_risk_indirect(address),
         )
+
+    def _participation_span(self, address: str) -> tuple[int, float]:
+        """该地址全部参与交易的（笔数, 最早~最晚时间戳跨度）。
+
+        汇聚/分散的“观测是否充分”除了看该方向对手方面，还要确认账户在两个
+        方向上都被观测过、且观测窗口足够长，因此跨度按全部参与交易计算。
+        """
+        times = sorted(t.timestamp for t in self._participation.get(address, ()))
+        if not times:
+            return 0, 0.0
+        return len(times), times[-1] - times[0]
 
     @staticmethod
     def _evidence(
@@ -114,21 +131,57 @@ class FactorCalculator:
                 gap_code="NO_INCOMING_TX",
                 gap_detail=f"地址 {address} 无任何入账交易，无法评估资金汇聚",
             )
+        # 未触发时，三类覆盖面缺口要如实分开（均为证据不足，不能当作安全放行）
         if n < self.CONVERGENCE_NEGATIVE_MIN_SOURCES:
             return self._evidence(
                 FactorCode.FUND_CONVERGENCE, False, 0.0,
-                f"{detail}；入账仅覆盖 {n} 个来源，样本方向不足以排除汇聚",
+                f"{detail}；入账仅覆盖 {n} 个来源，来源面不足以排除汇聚",
                 status=EvidenceStatus.INSUFFICIENT,
                 gap_code="TOO_FEW_INCOMING_SOURCES",
                 gap_detail=(
                     f"仅观察到 {n} 个不同入账来源（充分口径需 "
-                    f"{self.CONVERGENCE_NEGATIVE_MIN_SOURCES} 个），"
-                    "入账样本面太窄，不能排除资金汇聚"
+                    f"{self.CONVERGENCE_NEGATIVE_MIN_SOURCES} 个，且仍低于触发阈值 "
+                    f"{self.CONVERGENCE_IN_DEGREE}），入账来源面太窄，"
+                    "不能排除资金汇聚"
                 ),
                 related=tuple(sorted(sources)),
             )
+        if not self._out.get(address):
+            return self._evidence(
+                FactorCode.FUND_CONVERGENCE, False, 0.0,
+                f"{detail}；仅有入账、没有任何出账，观测方向单一",
+                status=EvidenceStatus.INSUFFICIENT,
+                gap_code="SINGLE_DIRECTION_ONLY",
+                gap_detail=(
+                    f"地址 {address} 只观察到入账方向交易，没有任何出账，"
+                    "资金进出全貌未覆盖（汇聚后的去向未被观测），"
+                    "样本方向单一，不能排除资金汇聚"
+                ),
+                related=tuple(sorted(sources)),
+            )
+        _, span = self._participation_span(address)
+        if span < self.FLOW_NEGATIVE_MIN_SPAN:
+            return self._evidence(
+                FactorCode.FUND_CONVERGENCE, False, 0.0,
+                f"{detail}；虽有 {n} 个入账来源且双向都有交易，但观测时间跨度仅 "
+                f"{span:.0f} 秒，不足以排除汇聚",
+                status=EvidenceStatus.INSUFFICIENT,
+                gap_code="OBSERVATION_SPAN_TOO_SHORT",
+                gap_detail=(
+                    f"双向交易已覆盖、入账来源 {n} 个，但整体观测时间跨度仅 "
+                    f"{span:.0f} 秒（充分口径需 ≥ "
+                    f"{self.FLOW_NEGATIVE_MIN_SPAN:.0f} 秒），"
+                    "观测窗口太短，历史上仍可能存在未被看到的汇聚，不能排除资金汇聚"
+                ),
+                related=tuple(sorted(sources)),
+            )
+        # 来源面足够、双向都看过、跨度足够且仍未触发：查过了确实没问题
         return self._evidence(
-            FactorCode.FUND_CONVERGENCE, False, 0.0, detail,
+            FactorCode.FUND_CONVERGENCE, False, 0.0,
+            (
+                f"{detail}；已观测到 {n} 个不同入账来源、出账方向也有交易、"
+                f"时间跨度 {span:.0f} 秒，观测面足以排除资金汇聚形态"
+            ),
             related=tuple(sorted(sources)),
         )
 
@@ -161,18 +214,53 @@ class FactorCalculator:
         if n < self.DISPERSION_NEGATIVE_MIN_TARGETS:
             return self._evidence(
                 FactorCode.FUND_DISPERSION, False, 0.0,
-                f"{detail}；出账仅覆盖 {n} 个目标，样本方向不足以排除分散",
+                f"{detail}；出账仅覆盖 {n} 个目标，目标面不足以排除分散",
                 status=EvidenceStatus.INSUFFICIENT,
                 gap_code="TOO_FEW_OUTGOING_TARGETS",
                 gap_detail=(
                     f"仅观察到 {n} 个不同出账目标（充分口径需 "
-                    f"{self.DISPERSION_NEGATIVE_MIN_TARGETS} 个），"
-                    "出账样本面太窄，不能排除资金分散"
+                    f"{self.DISPERSION_NEGATIVE_MIN_TARGETS} 个，且仍低于触发阈值 "
+                    f"{self.DISPERSION_OUT_DEGREE}），出账目标面太窄，"
+                    "不能排除资金分散"
                 ),
                 related=tuple(sorted(targets)),
             )
+        if not self._inn.get(address):
+            return self._evidence(
+                FactorCode.FUND_DISPERSION, False, 0.0,
+                f"{detail}；仅有出账、没有任何入账，观测方向单一",
+                status=EvidenceStatus.INSUFFICIENT,
+                gap_code="SINGLE_DIRECTION_ONLY",
+                gap_detail=(
+                    f"地址 {address} 只观察到出账方向交易，没有任何入账，"
+                    "资金进出全貌未覆盖（分散资金的来源未被观测），"
+                    "样本方向单一，不能排除资金分散"
+                ),
+                related=tuple(sorted(targets)),
+            )
+        _, span = self._participation_span(address)
+        if span < self.FLOW_NEGATIVE_MIN_SPAN:
+            return self._evidence(
+                FactorCode.FUND_DISPERSION, False, 0.0,
+                f"{detail}；虽有 {n} 个出账目标且双向都有交易，但观测时间跨度仅 "
+                f"{span:.0f} 秒，不足以排除分散",
+                status=EvidenceStatus.INSUFFICIENT,
+                gap_code="OBSERVATION_SPAN_TOO_SHORT",
+                gap_detail=(
+                    f"双向交易已覆盖、出账目标 {n} 个，但整体观测时间跨度仅 "
+                    f"{span:.0f} 秒（充分口径需 ≥ "
+                    f"{self.FLOW_NEGATIVE_MIN_SPAN:.0f} 秒），"
+                    "观测窗口太短，历史上仍可能存在未被看到的分散，不能排除资金分散"
+                ),
+                related=tuple(sorted(targets)),
+            )
+        # 目标面足够、双向都看过、跨度足够且仍未触发：查过了确实没问题
         return self._evidence(
-            FactorCode.FUND_DISPERSION, False, 0.0, detail,
+            FactorCode.FUND_DISPERSION, False, 0.0,
+            (
+                f"{detail}；已观测到 {n} 个不同出账目标、入账方向也有交易、"
+                f"时间跨度 {span:.0f} 秒，观测面足以排除资金分散形态"
+            ),
             related=tuple(sorted(targets)),
         )
 
